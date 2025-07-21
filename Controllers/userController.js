@@ -14,43 +14,31 @@ const getUsers = async (req, res) => {
     }
 };
 
-// Create new user (admin only)
+// Create new user
 const createUser = async (req, res) => {
     try {
         const { name, email, password, phone, role = 'user' } = req.body;
 
-        // Check if user already exists
-        const existingUser = await User.findOne({ email });
+        // Check for existing user (email or phone)
+        const existingUser = await User.findOne({ 
+            $or: [{ email }, { phone }] 
+        });
+        
         if (existingUser) {
-            return res.status(400).json({ message: 'User with this email already exists' });
+            return res.status(400).json({
+                message: existingUser.email === email 
+                    ? 'Email already in use' 
+                    : 'Phone number already in use'
+            });
         }
 
-        // Check if username already exists
-        const existingUsername = await User.findOne({ username: email.split('@')[0] });
-        if (existingUsername) {
-            return res.status(400).json({ message: 'Username already exists' });
-        }
-
-        // Check if phone number already exists
-        const existingPhone = await User.findOne({ phonenumber: phone });
-        if (existingPhone) {
-            return res.status(400).json({ message: 'Phone number already exists' });
-        }
-
-        // Split name into firstname and lastname
-        const nameParts = name.split(' ');
-        const firstname = nameParts[0] || '';
-        const lastname = nameParts.slice(1).join(' ') || firstname;
-
-        // Create user with correct field names
+        // Create user (no name splitting needed)
         const user = await User.create({
-            username: email.split('@')[0], // Use email prefix as username
+            name,
             email,
-            firstname,
-            lastname,
-            password, // Will be hashed by pre-save hook
-            role,
-            phonenumber: phone
+            phone,
+            password,
+            role
         });
 
         // Return user without password
@@ -63,6 +51,16 @@ const createUser = async (req, res) => {
         });
     } catch (error) {
         console.error('Error creating user:', error);
+        
+        // Handle Mongoose validation errors
+        if (error.name === 'ValidationError') {
+            const errors = {};
+            Object.keys(error.errors).forEach(key => {
+                errors[key] = error.errors[key].message;
+            });
+            return res.status(400).json({ message: 'Validation failed', errors });
+        }
+
         res.status(500).json({ 
             message: 'Error creating user',
             error: error.message 
@@ -70,7 +68,7 @@ const createUser = async (req, res) => {
     }
 };
 
-// Get user by ID (admin only)
+// Get user by ID
 const getUserById = async (req, res) => {
     try {
         const user = await User.findById(req.params.id).select('-password');
@@ -84,7 +82,7 @@ const getUserById = async (req, res) => {
     }
 };
 
-// Update user (admin only)
+// Update user
 const updateUser = async (req, res) => {
     try {
         const { password, ...updateData } = req.body;
@@ -93,10 +91,31 @@ const updateUser = async (req, res) => {
             updateData.password = await bcrypt.hash(password, 12);
         }
 
+        // Prevent email/phone duplication
+        if (updateData.email || updateData.phone) {
+            const existingUser = await User.findOne({
+                $and: [
+                    { _id: { $ne: req.params.id } }, // Not the current user
+                    { $or: [
+                        ...(updateData.email ? [{ email: updateData.email }] : []),
+                        ...(updateData.phone ? [{ phone: updateData.phone }] : [])
+                    ]}
+                ]
+            });
+
+            if (existingUser) {
+                return res.status(400).json({
+                    message: existingUser.email === updateData.email
+                        ? 'Email already in use'
+                        : 'Phone number already in use'
+                });
+            }
+        }
+
         const user = await User.findByIdAndUpdate(
             req.params.id,
             updateData,
-            { new: true }
+            { new: true, runValidators: true }
         ).select('-password');
 
         if (!user) {
@@ -109,6 +128,15 @@ const updateUser = async (req, res) => {
         });
     } catch (error) {
         console.error('Error updating user:', error);
+        
+        if (error.name === 'ValidationError') {
+            const errors = {};
+            Object.keys(error.errors).forEach(key => {
+                errors[key] = error.errors[key].message;
+            });
+            return res.status(400).json({ message: 'Validation failed', errors });
+        }
+
         res.status(500).json({ 
             message: 'Error updating user',
             error: error.message 
@@ -116,7 +144,7 @@ const updateUser = async (req, res) => {
     }
 };
 
-// Delete user (admin only)
+// Delete user
 const deleteUser = async (req, res) => {
     try {
         const user = await User.findByIdAndDelete(req.params.id);
@@ -133,7 +161,7 @@ const deleteUser = async (req, res) => {
     }
 };
 
-// Deactivate user (admin only)
+// Deactivate user
 const deactivateUser = async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(
@@ -156,7 +184,7 @@ const deactivateUser = async (req, res) => {
     }
 };
 
-// Get user orders (protected - users can see their own)
+// Get user orders
 const getMyOrders = async (req, res) => {
     try {
         const orders = await Order.find({ userId: req.user._id })
@@ -173,7 +201,7 @@ const getMyOrders = async (req, res) => {
     }
 };
 
-// Get issued gases (protected - users can see their own, admin can see any)
+// Get issued gases
 const getUserIssuedGases = async (req, res) => {
     try {
         const userId = req.user.role === 'admin' ? req.params.id : req.user._id;
@@ -196,7 +224,7 @@ const getUserIssuedGases = async (req, res) => {
     }
 };
 
-// Return gas cylinder (protected)
+// Return gas cylinder
 const returnGasCylinder = async (req, res) => {
     try {
         const user = await User.findById(req.params.userId);
@@ -204,9 +232,9 @@ const returnGasCylinder = async (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Verify the requesting user owns the gas or is admin
+        // Authorization check
         if (req.user._id.toString() !== req.params.userId && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Not authorized to return this gas' });
+            return res.status(403).json({ message: 'Not authorized' });
         }
 
         const issuedGas = user.issuedGases.find(
@@ -215,20 +243,20 @@ const returnGasCylinder = async (req, res) => {
 
         if (!issuedGas) {
             return res.status(404).json({ 
-                message: 'No issued gas found with that ID or already returned' 
+                message: 'Gas not found or already returned' 
             });
         }
 
+        // Update gas status
         issuedGas.returned = true;
         issuedGas.returnedAt = Date.now();
         await user.save();
 
         // Update product stock
-        const product = await Product.findById(issuedGas.gasId);
-        if (product) {
-            product.stockQuantity += 1;
-            await product.save();
-        }
+        await Product.findByIdAndUpdate(
+            issuedGas.gasId,
+            { $inc: { stockQuantity: 1 } }
+        );
 
         res.json({ 
             message: 'Gas cylinder returned successfully',
